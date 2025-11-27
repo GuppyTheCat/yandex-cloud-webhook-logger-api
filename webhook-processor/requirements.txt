@@ -1,0 +1,12 @@
+# Webhook Processor Container Dependencies
+# Python 3.12
+
+# FastAPI framework
+fastapi==0.109.0
+
+# ASGI server
+uvicorn[standard]==0.27.0
+
+# YDB Python SDK
+ydb==3.8.0
+

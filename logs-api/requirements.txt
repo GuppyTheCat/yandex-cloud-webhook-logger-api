@@ -1,0 +1,6 @@
+# Logs API Cloud Function Dependencies
+# Python 3.12
+
+# YDB Python SDK
+ydb==3.8.0
+

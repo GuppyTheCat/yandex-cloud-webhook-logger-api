@@ -1,0 +1,220 @@
+"""
+Logs API Cloud Function
+Retrieves webhook event history from YDB with filtering and pagination.
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+from typing import Optional
+import ydb
+import ydb.iam
+
+# Configure structured logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# YDB Configuration
+YDB_ENDPOINT = os.environ.get("YDB_ENDPOINT")
+YDB_DATABASE = os.environ.get("YDB_DATABASE")
+
+
+def get_ydb_driver():
+    """
+    Create and return YDB driver instance.
+    Uses service account authentication in Yandex Cloud environment.
+    """
+    if not YDB_ENDPOINT or not YDB_DATABASE:
+        raise ValueError("YDB_ENDPOINT and YDB_DATABASE must be set")
+
+    # Create driver with service account authentication
+    driver_config = ydb.DriverConfig(
+        endpoint=YDB_ENDPOINT,
+        database=YDB_DATABASE,
+        credentials=ydb.iam.MetadataUrlCredentials(),
+    )
+
+    driver = ydb.Driver(driver_config)
+
+    try:
+        driver.wait(timeout=5, fail_fast=True)
+        logger.info("Successfully connected to YDB")
+    except TimeoutError:
+        logger.error("Failed to connect to YDB: timeout")
+        raise
+
+    return driver
+
+
+def timestamp_to_iso(timestamp_us: int) -> str:
+    """Convert YDB timestamp (microseconds) to ISO string"""
+    dt = datetime.fromtimestamp(timestamp_us / 1_000_000, tz=datetime.timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def query_webhook_logs(
+    driver: ydb.Driver, limit: int = 50, event_type: Optional[str] = None
+) -> tuple[list, int]:
+    """
+    Query webhook logs from YDB.
+
+    Args:
+        driver: YDB driver instance
+        limit: Maximum number of results (default 50, max 100)
+        event_type: Optional filter by event type
+
+    Returns:
+        Tuple of (logs list, total count)
+    """
+    try:
+        session = driver.table_client.session().create()
+
+        # Build query based on filters
+        if event_type:
+            query = """
+            DECLARE $event_type AS Utf8;
+            DECLARE $limit AS Uint64;
+            
+            SELECT
+                log_id,
+                received_at,
+                event_type,
+                payload_json,
+                signature,
+                processed_at
+            FROM webhook_logs
+            WHERE event_type = $event_type
+            ORDER BY received_at DESC
+            LIMIT $limit;
+            """
+            params = {"$event_type": event_type, "$limit": limit}
+        else:
+            query = """
+            DECLARE $limit AS Uint64;
+            
+            SELECT
+                log_id,
+                received_at,
+                event_type,
+                payload_json,
+                signature,
+                processed_at
+            FROM webhook_logs
+            ORDER BY received_at DESC
+            LIMIT $limit;
+            """
+            params = {"$limit": limit}
+
+        # Execute query
+        result_sets = session.transaction(ydb.SerializableReadWrite()).execute(
+            query, params, commit_tx=True
+        )
+
+        # Parse results
+        logs = []
+        for row in result_sets[0].rows:
+            log_entry = {
+                "log_id": row.log_id.decode("utf-8")
+                if isinstance(row.log_id, bytes)
+                else row.log_id,
+                "received_at": timestamp_to_iso(row.received_at),
+                "event_type": row.event_type.decode("utf-8")
+                if isinstance(row.event_type, bytes)
+                else row.event_type,
+                "payload_json": json.loads(row.payload_json)
+                if row.payload_json
+                else {},
+                "processed_at": timestamp_to_iso(row.processed_at)
+                if row.processed_at
+                else None,
+            }
+            logs.append(log_entry)
+
+        total = len(logs)
+
+        logger.info(
+            "Retrieved %d webhook logs",
+            total,
+            extra={"event_type": event_type, "limit": limit},
+        )
+
+        return logs, total
+
+    except Exception as e:
+        logger.error(f"Error querying YDB: {str(e)}", exc_info=True)
+        raise
+    finally:
+        session.close()
+
+
+def handler(event, context):
+    """
+    Main Cloud Function handler for logs API.
+
+    GET /webhook/logs?limit=50&event_type=payment.success
+
+    Query Parameters:
+        - limit: Number of results (default 50, max 100)
+        - event_type: Filter by event type (optional)
+
+    Returns:
+        JSON response with logs array and total count
+    """
+    try:
+        # Extract query parameters
+        query_params = event.get("queryStringParameters", {}) or {}
+
+        # Parse limit parameter
+        limit_str = query_params.get("limit", "50")
+        try:
+            limit = int(limit_str)
+            # Enforce max limit
+            if limit > 100:
+                limit = 100
+            if limit < 1:
+                limit = 1
+        except ValueError:
+            limit = 50
+
+        # Parse event_type filter
+        event_type = query_params.get("event_type")
+
+        logger.info(
+            "Logs query request", extra={"limit": limit, "event_type": event_type}
+        )
+
+        # Connect to YDB and query logs
+        driver = get_ydb_driver()
+
+        try:
+            logs, total = query_webhook_logs(
+                driver=driver, limit=limit, event_type=event_type
+            )
+        finally:
+            driver.stop()
+
+        # Return response
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",  # Enable CORS for web clients
+            },
+            "body": json.dumps({"logs": logs, "total": total}),
+        }
+
+    except ValueError as e:
+        logger.error(f"Configuration error: {str(e)}")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Database configuration error"}),
+        }
+    except Exception as e:
+        logger.error(f"Error in logs handler: {str(e)}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal server error"}),
+        }
