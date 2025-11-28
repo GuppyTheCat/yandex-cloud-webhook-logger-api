@@ -12,11 +12,12 @@ import os
 import logging
 import sys
 from datetime import datetime, timezone
-import boto3
-from botocore.exceptions import ClientError
-import yandexcloud
-from yandex.cloud.lockbox.v1.payload_service_pb2 import GetPayloadRequest
-from yandex.cloud.lockbox.v1.payload_service_pb2_grpc import PayloadServiceStub
+from typing import Any, cast
+import boto3  # type: ignore
+# from botocore.exceptions import ClientError
+import yandexcloud  # type: ignore
+from yandex.cloud.lockbox.v1.payload_service_pb2 import GetPayloadRequest  # type: ignore
+from yandex.cloud.lockbox.v1.payload_service_pb2_grpc import PayloadServiceStub  # type: ignore
 
 
 # --- Structured Logging Setup ---
@@ -25,7 +26,7 @@ class PythonJSONFormatter(logging.Formatter):
     Formatter to output logs as JSON for Yandex Cloud Logging.
     """
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord):
         json_log = {
             "level": record.levelname,
             "message": record.getMessage(),
@@ -82,7 +83,7 @@ logger.setLevel(logging.INFO)
 
 # --- Global State (Warm Start Caching) ---
 sqs_client = None
-CACHED_SECRET_KEY = None
+cached_secret_key: str | None = None
 
 
 def init_ymq_client():
@@ -114,9 +115,9 @@ def get_cached_secret(iam_token: str):
     """
     Retrieve SECRET_KEY from cache or Lockbox.
     """
-    global CACHED_SECRET_KEY
-    if CACHED_SECRET_KEY:
-        return CACHED_SECRET_KEY
+    global cached_secret_key
+    if cached_secret_key:
+        return cached_secret_key
 
     lockbox_secret_id = os.environ.get("LOCKBOX_SECRET_ID")
     if not lockbox_secret_id:
@@ -125,15 +126,15 @@ def get_cached_secret(iam_token: str):
 
     logger.info("Fetching secret from Lockbox (Cold Start)")
     try:
-        sdk = yandexcloud.SDK(iam_token=iam_token)
+        sdk = yandexcloud.SDK(iam_token=iam_token)  # type: ignore
         lockbox_client = sdk.client(PayloadServiceStub)
         request = GetPayloadRequest(secret_id=lockbox_secret_id)
         response = lockbox_client.Get(request)
 
         for entry in response.entries:
             if entry.key == "SECRET_KEY":
-                CACHED_SECRET_KEY = entry.text_value
-                return CACHED_SECRET_KEY
+                cached_secret_key = entry.text_value
+                return cached_secret_key
 
         raise ValueError("SECRET_KEY key not found in Lockbox secret")
 
@@ -163,19 +164,18 @@ def validate_hmac_signature(body: str, signature_header: str, secret_key: str) -
         return False
 
 
-def handler(event, context):
+def handler(event: dict[str, Any], context: Any):
     """
     Main Cloud Function handler.
     """
     try:
         # 1. Extract request details
-        http_method = event.get("httpMethod", "POST")
-        headers = event.get("headers", {})
-        body = event.get("body", "")
+        headers = cast(dict[str, Any], event.get("headers", {}))
+        body = cast(str, event.get("body", ""))
 
         # Normalize headers
         headers_lower = {k.lower(): v for k, v in headers.items()}
-        signature_header = headers_lower.get("x-webhook-signature", "")
+        signature_header = str(headers_lower.get("x-webhook-signature", ""))
 
         # 2. Authentication (IAM Token for Lockbox)
         iam_token = None
@@ -188,6 +188,8 @@ def handler(event, context):
 
         # 3. Get Secret (Cached or Fresh)
         try:
+            if not iam_token:
+                raise ValueError("IAM token not available")
             secret_key = get_cached_secret(iam_token)
         except Exception:
             return {

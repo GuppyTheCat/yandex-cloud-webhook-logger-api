@@ -7,12 +7,12 @@ Triggered by YMQ Trigger with batches of up to 10 messages.
 import os
 import json
 import logging
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, timezone
+from typing import Any
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-import ydb
-import ydb.iam
+import ydb  # type: ignore
+import ydb.iam  # type: ignore
 
 # Configure structured logging
 logging.basicConfig(
@@ -43,7 +43,7 @@ class YMQMessageDetails(BaseModel):
 class YMQTriggerPayload(BaseModel):
     """Model for YMQ trigger request"""
 
-    messages: List[Dict[str, Any]]
+    messages: list[dict[str, Any]]
 
 
 def get_ydb_driver():
@@ -64,7 +64,7 @@ def get_ydb_driver():
     driver = ydb.Driver(driver_config)
 
     try:
-        driver.wait(timeout=5, fail_fast=True)
+        driver.wait(timeout=5, fail_fast=True)  # type: ignore
         logger.info("Successfully connected to YDB")
     except TimeoutError:
         logger.error("Failed to connect to YDB: timeout")
@@ -78,7 +78,7 @@ def insert_webhook_log(
     log_id: str,
     received_at: str,
     event_type: str,
-    payload_json: dict,
+    payload_json: dict[str, Any],
     signature: str,
 ) -> bool:
     """
@@ -96,7 +96,7 @@ def insert_webhook_log(
         True if successful, False otherwise
     """
     try:
-        session = driver.table_client.session().create()
+        session = driver.table_client.session().create()  # type: ignore
 
         # Convert ISO timestamp to YDB Timestamp
         # YDB expects microseconds since epoch
@@ -104,7 +104,9 @@ def insert_webhook_log(
         received_at_timestamp = int(dt.timestamp() * 1_000_000)
 
         # Current timestamp for processed_at
-        processed_at_timestamp = int(datetime.now(datetime.timezone.utc).timestamp() * 1_000_000)
+        processed_at_timestamp = int(
+            datetime.now(timezone.utc).timestamp() * 1_000_000
+        )
 
         # Prepare query
         query = """
@@ -114,7 +116,7 @@ def insert_webhook_log(
         DECLARE $payload_json AS JsonDocument;
         DECLARE $signature AS Utf8;
         DECLARE $processed_at AS Timestamp;
-        
+
         UPSERT INTO webhook_logs (
             log_id,
             received_at,
@@ -132,10 +134,10 @@ def insert_webhook_log(
         );
         """
 
-        prepared_query = session.prepare(query)
+        prepared_query: Any = session.prepare(query)  # type: ignore
 
         # Execute query
-        session.transaction(ydb.SerializableReadWrite()).execute(
+        session.transaction(ydb.SerializableReadWrite()).execute(  # type: ignore
             prepared_query,
             {
                 "$log_id": log_id,
@@ -161,7 +163,7 @@ def insert_webhook_log(
         )
         return False
     finally:
-        session.close()
+        session.close()  # type: ignore
 
 
 def process_message(driver: ydb.Driver, message_body: str) -> bool:
@@ -289,7 +291,8 @@ async def process_ymq_trigger(request: Request):
 
         logger.info(
             "Batch processing complete: %d success, %d errors",
-            success_count, error_count
+            success_count,
+            error_count,
         )
 
         # Return 200 OK to acknowledge messages

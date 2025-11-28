@@ -7,9 +7,9 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
-import ydb
-import ydb.iam
+from typing import Any, cast
+import ydb  # type: ignore
+import ydb.iam  # type: ignore
 
 # Configure structured logging
 logger = logging.getLogger()
@@ -38,7 +38,7 @@ def get_ydb_driver():
     driver = ydb.Driver(driver_config)
 
     try:
-        driver.wait(timeout=5, fail_fast=True)
+        driver.wait(timeout=5, fail_fast=True)  # type: ignore
         logger.info("Successfully connected to YDB")
     except TimeoutError:
         logger.error("Failed to connect to YDB: timeout")
@@ -54,8 +54,8 @@ def timestamp_to_iso(timestamp_us: int) -> str:
 
 
 def query_webhook_logs(
-    driver: ydb.Driver, limit: int = 50, event_type: Optional[str] = None
-) -> tuple[list, int]:
+    driver: ydb.Driver, limit: int = 50, event_type: str | None = None
+) -> tuple[list[dict[str, Any]], int]:
     """
     Query webhook logs from YDB.
 
@@ -68,7 +68,7 @@ def query_webhook_logs(
         Tuple of (logs list, total count)
     """
     try:
-        session = driver.table_client.session().create()
+        session = driver.table_client.session().create()  # type: ignore
 
         # Build query based on filters - check for None and empty string
         if event_type is not None and event_type != "":
@@ -111,27 +111,28 @@ def query_webhook_logs(
         logger.info(f"Executing query with params: {params}")
 
         # Prepare and execute query
-        prepared_query = session.prepare(query)
-        result_sets = session.transaction(ydb.SerializableReadWrite()).execute(
+        prepared_query: Any = session.prepare(query)  # type: ignore
+        result_sets = session.transaction(ydb.SerializableReadWrite()).execute(  # type: ignore
             prepared_query, params, commit_tx=True
         )
 
         # Parse results
-        logs = []
-        for row in result_sets[0].rows:
-            log_entry = {
-                "log_id": row.log_id.decode("utf-8")
-                if isinstance(row.log_id, bytes)
-                else row.log_id,
-                "received_at": timestamp_to_iso(row.received_at),
-                "event_type": row.event_type.decode("utf-8")
-                if isinstance(row.event_type, bytes)
-                else row.event_type,
-                "payload_json": json.loads(row.payload_json)
-                if row.payload_json
+        logs: list[dict[str, Any]] = []
+        for row in result_sets[0].rows:  # type: ignore
+            r = cast(Any, row)
+            log_entry: dict[str, Any] = {
+                "log_id": r.log_id.decode("utf-8")
+                if isinstance(r.log_id, bytes)
+                else r.log_id,
+                "received_at": timestamp_to_iso(r.received_at),
+                "event_type": r.event_type.decode("utf-8")
+                if isinstance(r.event_type, bytes)
+                else r.event_type,
+                "payload_json": json.loads(r.payload_json)
+                if r.payload_json
                 else {},
-                "processed_at": timestamp_to_iso(row.processed_at)
-                if row.processed_at
+                "processed_at": timestamp_to_iso(r.processed_at)
+                if r.processed_at
                 else None,
             }
             logs.append(log_entry)
@@ -151,7 +152,7 @@ def query_webhook_logs(
         raise
 
 
-def handler(event, context):
+def handler(event: dict[str, Any], context: Any):
     """
     Main Cloud Function handler for logs API.
 
@@ -166,7 +167,7 @@ def handler(event, context):
     """
     try:
         # Extract query parameters
-        query_params = event.get("queryStringParameters", {}) or {}
+        query_params = cast(dict[str, Any], event.get("queryStringParameters", {}) or {})
 
         # Parse limit parameter
         limit_str = query_params.get("limit", "50")
