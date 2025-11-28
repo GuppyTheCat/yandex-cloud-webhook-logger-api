@@ -4,29 +4,30 @@ Fast webhook receiver that validates HMAC signature and enqueues to YMQ.
 Target response time: < 200ms
 """
 
-import hmac
 import hashlib
+import hmac
 import json
-import uuid
-import os
 import logging
+import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from typing import Any, cast
+
 import boto3  # type: ignore
-# from botocore.exceptions import ClientError
 import yandexcloud  # type: ignore
 from yandex.cloud.lockbox.v1.payload_service_pb2 import GetPayloadRequest  # type: ignore
 from yandex.cloud.lockbox.v1.payload_service_pb2_grpc import PayloadServiceStub  # type: ignore
 
-
 # --- Structured Logging Setup ---
+
+
 class PythonJSONFormatter(logging.Formatter):
     """
     Formatter to output logs as JSON for Yandex Cloud Logging.
     """
 
-    def format(self, record: logging.LogRecord):
+    def format(self, record: logging.LogRecord) -> str:
         json_log = {
             "level": record.levelname,
             "message": record.getMessage(),
@@ -38,8 +39,7 @@ class PythonJSONFormatter(logging.Formatter):
             "function": record.funcName,
         }
 
-        # Add extra fields from the record (those passed via extra={...})
-        # We filter out standard LogRecord attributes to avoid clutter
+        # Attributes to exclude
         base_attributes = {
             "args",
             "asctime",
@@ -76,198 +76,210 @@ class PythonJSONFormatter(logging.Formatter):
 handler_log = logging.StreamHandler(sys.stdout)
 handler_log.setFormatter(PythonJSONFormatter())
 logger = logging.getLogger()
-logger.handlers = []  # Remove default handlers
+logger.handlers = []
 logger.addHandler(handler_log)
 logger.setLevel(logging.INFO)
 
 
-# --- Global State (Warm Start Caching) ---
-sqs_client = None
-cached_secret_key: str | None = None
+# --- Configuration ---
 
 
-def init_ymq_client():
-    """
-    Initialize global YMQ client if not exists.
-    Using global variable ensures we only connect once per container instance (Warm Start).
-    """
-    global sqs_client
-    if sqs_client:
-        return sqs_client
+class Config:
+    """Application configuration."""
 
-    # Credentials should be provided via environment variables
-    # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-    # If not set, boto3 will fail gracefully
+    LOCKBOX_SECRET_ID: str = os.environ.get("LOCKBOX_SECRET_ID", "")
+    YMQ_QUEUE_URL: str = os.environ.get("YMQ_QUEUE_URL", "")
+    AWS_ACCESS_KEY_ID: str = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY: str = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    IAM_TOKEN: str = os.environ.get("IAM_TOKEN", "")  # For local dev/fallback
 
-    try:
-        sqs_client = boto3.client(
-            "sqs",
-            endpoint_url="https://message-queue.api.cloud.yandex.net",
-            region_name="ru-central1",
+    @classmethod
+    def validate(cls) -> None:
+        if not cls.LOCKBOX_SECRET_ID:
+            raise ValueError("LOCKBOX_SECRET_ID is required")
+        if not cls.YMQ_QUEUE_URL:
+            raise ValueError("YMQ_QUEUE_URL is required")
+
+
+# --- Services ---
+
+
+class SecretService:
+    """Handles retrieval and caching of secrets from Lockbox."""
+
+    _cached_secret_key: str | None = None
+
+    @classmethod
+    def get_secret_key(cls, iam_token: str | None) -> str:
+        """
+        Get webhook secret key, using cache if available.
+        """
+        if cls._cached_secret_key:
+            return cls._cached_secret_key
+
+        if not Config.LOCKBOX_SECRET_ID:
+            raise ValueError("LOCKBOX_SECRET_ID not configured")
+
+        if not iam_token:
+            # Fallback to env var for local testing if no context token
+            iam_token = Config.IAM_TOKEN
+            if not iam_token:
+                raise ValueError("IAM token required for Lockbox access")
+
+        logger.info("Fetching secret from Lockbox (Cold Start)")
+        try:
+            sdk = yandexcloud.SDK(iam_token=iam_token)  # type: ignore
+            lockbox_client = sdk.client(PayloadServiceStub)  # type: ignore
+            request = GetPayloadRequest(secret_id=Config.LOCKBOX_SECRET_ID)
+            response = lockbox_client.Get(request)
+
+            for entry in response.entries:
+                if entry.key == "SECRET_KEY":
+                    return str(entry.text_value)
+
+            raise ValueError("SECRET_KEY not found in Lockbox secret")
+        except Exception as e:
+            logger.error(f"Lockbox error: {e}")
+            raise
+
+
+class QueueService:
+    """Handles interaction with Yandex Message Queue."""
+
+    _sqs_client: Any = None
+
+    @classmethod
+    def get_client(cls) -> Any:
+        """Initialize and return cached boto3 client."""
+        if cls._sqs_client:
+            return cls._sqs_client
+
+        try:
+            client: Any = boto3.client(  # type: ignore
+                "sqs",
+                endpoint_url="https://message-queue.api.cloud.yandex.net",
+                region_name="ru-central1",
+                # Credentials auto-picked from env vars:
+                # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+            )
+            cls._sqs_client = client
+            return cls._sqs_client  # type: ignore
+        except Exception as e:
+            logger.error(f"Failed to init YMQ client: {e}")
+            raise
+
+    @classmethod
+    def enqueue_message(cls, message: dict[str, Any]) -> None:
+        """Send message to YMQ."""
+        client = cls.get_client()
+        if not Config.YMQ_QUEUE_URL:
+            raise ValueError("YMQ_QUEUE_URL not configured")
+
+        client.send_message(
+            QueueUrl=Config.YMQ_QUEUE_URL, MessageBody=json.dumps(message)
         )
-        return sqs_client
-    except Exception as e:
-        logger.error(f"Failed to init YMQ client: {str(e)}")
-        return None
 
 
-def get_cached_secret(iam_token: str):
-    """
-    Retrieve SECRET_KEY from cache or Lockbox.
-    """
-    global cached_secret_key
-    if cached_secret_key:
-        return cached_secret_key
+class WebhookValidator:
+    """Validates webhook signatures."""
 
-    lockbox_secret_id = os.environ.get("LOCKBOX_SECRET_ID")
-    if not lockbox_secret_id:
-        logger.error("LOCKBOX_SECRET_ID not configured")
-        raise ValueError("LOCKBOX_SECRET_ID not configured")
+    @staticmethod
+    def validate_signature(body: str, signature_header: str, secret_key: str) -> bool:
+        """
+        Validate HMAC-SHA256 signature using timing-safe comparison.
+        """
+        if not signature_header or not signature_header.startswith("sha256="):
+            return False
 
-    logger.info("Fetching secret from Lockbox (Cold Start)")
-    try:
-        sdk = yandexcloud.SDK(iam_token=iam_token)  # type: ignore
-        lockbox_client = sdk.client(PayloadServiceStub)
-        request = GetPayloadRequest(secret_id=lockbox_secret_id)
-        response = lockbox_client.Get(request)
+        try:
+            expected_signature = signature_header[7:]  # Remove 'sha256=' prefix
 
-        for entry in response.entries:
-            if entry.key == "SECRET_KEY":
-                cached_secret_key = entry.text_value
-                return cached_secret_key
+            # Calculate HMAC signature
+            calculated_signature = hmac.new(
+                secret_key.encode("utf-8"), body.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
 
-        raise ValueError("SECRET_KEY key not found in Lockbox secret")
-
-    except Exception as e:
-        logger.error(f"Lockbox error: {str(e)}")
-        raise
+            return hmac.compare_digest(calculated_signature, expected_signature)
+        except Exception as e:
+            logger.error(f"Signature validation error: {e}")
+            return False
 
 
-def validate_hmac_signature(body: str, signature_header: str, secret_key: str) -> bool:
-    """
-    Validate HMAC-SHA256 signature using timing-safe comparison.
-    """
-    if not signature_header or not signature_header.startswith("sha256="):
-        return False
-
-    try:
-        expected_signature = signature_header[7:]  # Remove 'sha256=' prefix
-
-        # Calculate HMAC signature
-        calculated_signature = hmac.new(
-            secret_key.encode("utf-8"), body.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-
-        return hmac.compare_digest(calculated_signature, expected_signature)
-    except Exception as e:
-        logger.error(f"Signature validation error: {str(e)}")
-        return False
+# --- Main Handler ---
 
 
-def handler(event: dict[str, Any], context: Any):
+def build_response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
+    """Helper to build standard API Gateway response."""
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body),
+    }
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """
     Main Cloud Function handler.
     """
     try:
-        # 1. Extract request details
+        # 1. Extract Request
         headers = cast(dict[str, Any], event.get("headers", {}))
         body = cast(str, event.get("body", ""))
 
-        # Normalize headers
+        # Normalize headers to lower case
         headers_lower = {k.lower(): v for k, v in headers.items()}
         signature_header = str(headers_lower.get("x-webhook-signature", ""))
 
-        # 2. Authentication (IAM Token for Lockbox)
+        # 2. Get Auth Token (from context or env)
         iam_token = None
         if context and hasattr(context, "token"):
             iam_token = context.token.get("access_token")
 
-        # Fallback for local testing
-        if not iam_token:
-            iam_token = os.environ.get("IAM_TOKEN")
-
-        # 3. Get Secret (Cached or Fresh)
+        # 3. Retrieve Secret
         try:
-            if not iam_token:
-                raise ValueError("IAM token not available")
-            secret_key = get_cached_secret(iam_token)
-        except Exception:
-            return {
-                "statusCode": 500,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"error": "Configuration error"}),
-            }
+            secret_key = SecretService.get_secret_key(iam_token)
+        except ValueError as e:
+            logger.error(f"Configuration/Auth error: {e}")
+            return build_response(500, {"error": "Configuration error"})
 
         # 4. Validate Signature
-        if not validate_hmac_signature(body, signature_header, secret_key):
+        if not WebhookValidator.validate_signature(body, signature_header, secret_key):
             logger.warning("Invalid signature", extra={"signature": signature_header})
-            return {
-                "statusCode": 401,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"error": "Invalid signature"}),
-            }
+            return build_response(401, {"error": "Invalid signature"})
 
-        # 5. Parse Payload (Minimal check)
+        # 5. Parse Payload
         try:
             payload = json.loads(body)
             event_type = payload.get("event_type", "unknown")
         except json.JSONDecodeError:
-            return {
-                "statusCode": 400,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"error": "Invalid JSON payload"}),
-            }
+            return build_response(400, {"error": "Invalid JSON payload"})
 
-        # 6. Enqueue to YMQ
+        # 6. Prepare Message
         log_id = str(uuid.uuid4())
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
         message = {
             "log_id": log_id,
-            "received_at": datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
+            "received_at": timestamp,
             "event_type": event_type,
             "payload": payload,
             "signature": signature_header,
         }
 
-        queue_url = os.environ.get("YMQ_QUEUE_URL")
-        sqs = init_ymq_client()
+        # 7. Enqueue
+        try:
+            QueueService.enqueue_message(message)
+            logger.info(
+                "Webhook accepted",
+                extra={"log_id": log_id, "event_type": event_type},
+            )
+            return build_response(200, {"status": "received", "log_id": log_id})
 
-        if sqs and queue_url:
-            try:
-                sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(message))
-                logger.info(
-                    "Webhook accepted",
-                    extra={"log_id": log_id, "event_type": event_type},
-                )
-            except Exception as e:
-                logger.error(f"YMQ Error: {str(e)}")
-                # Decide if we want to fail hard or return 200 accepted but failed to process?
-                # Task requires guaranteed processing, so 500 is better so sender retries.
-                return {
-                    "statusCode": 500,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"error": "Failed to enqueue message"}),
-                }
-        else:
-            logger.error("YMQ configuration missing (queue_url or client)")
-            return {
-                "statusCode": 500,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"error": "Configuration error"}),
-            }
-
-        # 7. Success Response
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"status": "received", "log_id": log_id}),
-        }
+        except Exception as e:
+            logger.error(f"YMQ Error: {e}", exc_info=True)
+            # Return 500 to trigger retry from sender
+            return build_response(500, {"error": "Failed to enqueue message"})
 
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        return {
-            "statusCode": 500,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": "Internal server error"}),
-        }
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return build_response(500, {"error": "Internal server error"})
