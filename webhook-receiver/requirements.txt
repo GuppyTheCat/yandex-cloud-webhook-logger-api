@@ -2,9 +2,12 @@
 # Python 3.12
 
 # AWS SDK for Python (YMQ is SQS-compatible)
-boto3==1.34.0
+boto3==1.35.0
+botocore==1.35.0
 
-# Note: For production, you may want to use Yandex Cloud Lockbox SDK
-# However, for simplicity, we'll use environment variables
-# yandexcloud==0.270.0
+# Yandex Cloud SDK for Lockbox integration
+yandexcloud==0.329.0
+
+# Required for service account authentication
+grpcio==1.68.1
 
