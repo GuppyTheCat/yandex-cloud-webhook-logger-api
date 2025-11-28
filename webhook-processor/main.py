@@ -163,7 +163,7 @@ def insert_webhook_log(
         )
         return False
     finally:
-        session.close()  # type: ignore
+        session.delete()  # type: ignore
 
 
 def process_message(driver: ydb.Driver, message_body: str) -> bool:
