@@ -6,7 +6,7 @@ Retrieves webhook event history from YDB with filtering and pagination.
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import ydb
 import ydb.iam
@@ -49,7 +49,7 @@ def get_ydb_driver():
 
 def timestamp_to_iso(timestamp_us: int) -> str:
     """Convert YDB timestamp (microseconds) to ISO string"""
-    dt = datetime.fromtimestamp(timestamp_us / 1_000_000, tz=datetime.timezone.utc)
+    dt = datetime.fromtimestamp(timestamp_us / 1_000_000, tz=timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")
 
 
@@ -70,12 +70,13 @@ def query_webhook_logs(
     try:
         session = driver.table_client.session().create()
 
-        # Build query based on filters
-        if event_type:
+        # Build query based on filters - check for None and empty string
+        if event_type is not None and event_type != "":
+            logger.info(f"Querying with event_type filter: {event_type}")
             query = """
             DECLARE $event_type AS Utf8;
             DECLARE $limit AS Uint64;
-            
+
             SELECT
                 log_id,
                 received_at,
@@ -90,9 +91,10 @@ def query_webhook_logs(
             """
             params = {"$event_type": event_type, "$limit": limit}
         else:
+            logger.info(f"Querying without event_type filter, limit: {limit}")
             query = """
             DECLARE $limit AS Uint64;
-            
+
             SELECT
                 log_id,
                 received_at,
@@ -106,9 +108,12 @@ def query_webhook_logs(
             """
             params = {"$limit": limit}
 
-        # Execute query
+        logger.info(f"Executing query with params: {params}")
+
+        # Prepare and execute query
+        prepared_query = session.prepare(query)
         result_sets = session.transaction(ydb.SerializableReadWrite()).execute(
-            query, params, commit_tx=True
+            prepared_query, params, commit_tx=True
         )
 
         # Parse results
@@ -144,8 +149,6 @@ def query_webhook_logs(
     except Exception as e:
         logger.error(f"Error querying YDB: {str(e)}", exc_info=True)
         raise
-    finally:
-        session.close()
 
 
 def handler(event, context):
