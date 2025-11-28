@@ -4,3 +4,5 @@
 # YDB Python SDK
 ydb==3.22.0
 
+# Explicitly pin grpcio to match Yandex Cloud SDK requirements
+grpcio==1.70.0
