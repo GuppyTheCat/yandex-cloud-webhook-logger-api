@@ -121,10 +121,10 @@ BODY1=$(echo "$RESPONSE1" | head -n-1)
 if [ "$HTTP_CODE1" == "200" ]; then
     print_success "Valid signature accepted (HTTP $HTTP_CODE1)"
     print_info "Response time: ${TIME1}s"
-    if python3 -c "import sys; sys.exit(0 if float('$TIME1') < 0.5 else 1)"; then
-        print_success "Response time within limits (< 0.5s client-side)"
+    if python3 -c "import sys; sys.exit(0 if float('$TIME1') < 0.2 else 1)"; then
+        print_success "Response time within limits (< 0.2s client-side)"
     else
-        print_info "Response time > 0.5s (check network or function cold start)"
+        print_info "Response time > 0.2s (check network or function cold start)"
     fi
     if command -v jq >/dev/null 2>&1; then
         echo "$BODY1" | jq '.'
