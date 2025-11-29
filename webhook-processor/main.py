@@ -39,15 +39,16 @@ class Config:
             )
 
 
-# Global YDB Driver
+# Global YDB Driver and Session Pool
 _ydb_driver: Optional[ydb.Driver] = None
+_ydb_session_pool: Optional[ydb.SessionPool] = None
 
 
-def get_ydb_driver() -> ydb.Driver:
-    """Dependency to get the global YDB driver instance."""
-    if _ydb_driver is None:
-        raise RuntimeError("YDB Driver not initialized")
-    return _ydb_driver
+def get_ydb_pool() -> ydb.SessionPool:
+    """Dependency to get the global YDB session pool."""
+    if _ydb_session_pool is None:
+        raise RuntimeError("YDB Session Pool not initialized")
+    return _ydb_session_pool
 
 
 @asynccontextmanager
@@ -56,7 +57,7 @@ async def lifespan(app: FastAPI):
     Lifespan context manager for FastAPI.
     Handles startup and shutdown events, specifically YDB driver lifecycle.
     """
-    global _ydb_driver
+    global _ydb_driver, _ydb_session_pool
 
     Config.validate()
     logger.info("Initializing YDB driver...")
@@ -74,6 +75,7 @@ async def lifespan(app: FastAPI):
         driver.wait(timeout=5, fail_fast=True)  # type: ignore
 
         _ydb_driver = driver
+        _ydb_session_pool = ydb.SessionPool(driver)
         logger.info("Successfully connected to YDB")
 
         yield
@@ -82,9 +84,12 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize YDB driver: {e}")
         raise
     finally:
+        if _ydb_session_pool:
+            logger.info("Stopping YDB session pool...")
+            _ydb_session_pool.stop()  # type: ignore
         if _ydb_driver:
             logger.info("Stopping YDB driver...")
-            _ydb_driver.stop()
+            _ydb_driver.stop()  # type: ignore
 
 
 # --- Domain Models ---
@@ -114,17 +119,16 @@ class ProcessingResult(BaseModel):
 class WebhookRepository:
     """Abstration for Webhook Log storage operations."""
 
-    def __init__(self, driver: ydb.Driver):
-        self.driver = driver
+    def __init__(self, pool: ydb.SessionPool):
+        self.pool = pool
 
     def insert_log(self, webhook_data: WebhookPayload) -> bool:
         """
         Insert a webhook log entry into YDB.
         """
         try:
-            # Use a synchronous wrapper for the transaction since ydb-python-sdk
-            # async support might require a different setup, staying safe with sync driver.
-            return self.driver.table_client.retry_operation_sync(  # type: ignore
+            # Use a synchronous wrapper for the transaction
+            return self.pool.retry_operation_sync(  # type: ignore
                 self._insert_tx,
                 None,  # retry_settings
                 webhook_data,
@@ -232,7 +236,7 @@ async def health_check():
 
 @app.post("/ymq-trigger", response_model=ProcessingResult)
 async def process_ymq_trigger(
-    request: Request, driver: ydb.Driver = Depends(get_ydb_driver)
+    request: Request, pool: ydb.SessionPool = Depends(get_ydb_pool)
 ):
     """
     Endpoint called by YMQ Trigger.
@@ -247,7 +251,7 @@ async def process_ymq_trigger(
         if not messages:
             return ProcessingResult(status="success", processed=0)
 
-        repo = WebhookRepository(driver)
+        repo = WebhookRepository(pool)
         success_count = 0
         error_count = 0
 
