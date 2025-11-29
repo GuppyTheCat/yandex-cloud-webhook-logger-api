@@ -91,7 +91,6 @@ class Config:
     YMQ_QUEUE_URL: str = os.environ.get("YMQ_QUEUE_URL", "")
     AWS_ACCESS_KEY_ID: str = os.environ.get("AWS_ACCESS_KEY_ID", "")
     AWS_SECRET_ACCESS_KEY: str = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    IAM_TOKEN: str = os.environ.get("IAM_TOKEN", "")  # For local dev/fallback
 
     @classmethod
     def validate(cls) -> None:
@@ -120,22 +119,18 @@ class SecretService:
         if not Config.LOCKBOX_SECRET_ID:
             raise ValueError("LOCKBOX_SECRET_ID not configured")
 
-        if not iam_token:
-            # Fallback to env var for local testing if no context token
-            iam_token = Config.IAM_TOKEN
-            if not iam_token:
-                raise ValueError("IAM token required for Lockbox access")
-
-        logger.info("Fetching secret from Lockbox (Cold Start)")
+        logger.info("Fetching secret from Lockbox (Cold Start / Cache Miss)")
         try:
-            sdk = yandexcloud.SDK(iam_token=iam_token)  # type: ignore
-            lockbox_client = sdk.client(PayloadServiceStub)  # type: ignore
+            # Initialize SDK with IAM token from context
+            sdk: Any = yandexcloud.SDK(iam_token=iam_token)  # type: ignore
+            lockbox_client: Any = sdk.client(PayloadServiceStub)  # type: ignore
             request = GetPayloadRequest(secret_id=Config.LOCKBOX_SECRET_ID)
             response = lockbox_client.Get(request)
 
             for entry in response.entries:
                 if entry.key == "SECRET_KEY":
-                    return str(entry.text_value)
+                    cls._cached_secret_key = str(entry.text_value)
+                    return cls._cached_secret_key
 
             raise ValueError("SECRET_KEY not found in Lockbox secret")
         except Exception as e:
@@ -217,6 +212,13 @@ def build_response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Initialize client globally to potentially benefit from warm starts
+try:
+    QueueService.get_client()
+except Exception:
+    pass  # Ignore init errors at module level
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """
     Main Cloud Function handler.
@@ -230,17 +232,20 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         headers_lower = {k.lower(): v for k, v in headers.items()}
         signature_header = str(headers_lower.get("x-webhook-signature", ""))
 
-        # 2. Get Auth Token (from context or env)
+        # 2. Get Auth Token (from context)
         iam_token = None
         if context and hasattr(context, "token"):
             iam_token = context.token.get("access_token")
 
-        # 3. Retrieve Secret
+        # 3. Retrieve Secret (from Lockbox)
         try:
             secret_key = SecretService.get_secret_key(iam_token)
         except ValueError as e:
             logger.error(f"Configuration/Auth error: {e}")
             return build_response(500, {"error": "Configuration error"})
+        except Exception as e:
+            logger.error(f"Secret retrieval failed: {e}")
+            return build_response(500, {"error": "Internal setup error"})
 
         # 4. Validate Signature
         if not WebhookValidator.validate_signature(body, signature_header, secret_key):
