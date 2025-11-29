@@ -6,11 +6,11 @@ Target response time: < 200ms
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import sys
 import uuid
+import orjson as json  # Replace standard json with orjson
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -67,7 +67,8 @@ class PythonJSONFormatter(logging.Formatter):
             if key not in base_attributes and not key.startswith("_"):
                 json_log[key] = value
 
-        return json.dumps(json_log)
+        # orjson returns bytes, so decode to str
+        return json.dumps(json_log).decode('utf-8')
 
 
 # Configure root logger
@@ -146,8 +147,9 @@ class QueueService:
         if not Config.YMQ_QUEUE_URL:
             raise ValueError("YMQ_QUEUE_URL not configured")
 
+        # orjson.dumps returns bytes, boto3 expects string
         client.send_message(
-            QueueUrl=Config.YMQ_QUEUE_URL, MessageBody=json.dumps(message)
+            QueueUrl=Config.YMQ_QUEUE_URL, MessageBody=json.dumps(message).decode('utf-8')
         )
 
 
@@ -184,7 +186,7 @@ def build_response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
     return {
         "statusCode": status_code,
         "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
+        "body": json.dumps(body).decode('utf-8'),
     }
 
 

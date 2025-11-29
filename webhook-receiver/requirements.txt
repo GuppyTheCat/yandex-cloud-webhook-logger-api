@@ -4,3 +4,4 @@
 # AWS SDK for Python (YMQ is SQS-compatible)
 boto3==1.35.0
 botocore==1.35.0
+orjson==3.9.10
