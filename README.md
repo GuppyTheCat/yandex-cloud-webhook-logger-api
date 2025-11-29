@@ -353,7 +353,6 @@ curl "$LOGS_API_URL?limit=10&event_type=payment.success" | jq .
 *   `webhook-processor/` - Код обработчика очереди (FastAPI + Docker).
 *   `logs-api/` - Код функции просмотра истории.
 *   `ydb_schemas/` - SQL схема таблицы.
-*   `commands.txt` - История команд CLI, использованных при настройке.
 
 ---
 **Разработано в рамках тестового задания.**
