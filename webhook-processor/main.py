@@ -197,16 +197,36 @@ def process_single_message(repo: WebhookRepository, message_body: str) -> bool:
     try:
         data = json.loads(message_body)
 
-        # Validate using Pydantic model
-        # Note: The message body structure matches what we expect in WebhookPayload
-        # except 'payload' field in JSON might correspond to WebhookPayload.payload
+        # Receiver sends raw payload string in 'payload' key
+        raw_payload = data.get("payload")
+
+        payload_dict: Dict[str, Any] = {}
+        event_type: Optional[str] = None
+
+        if isinstance(raw_payload, str):
+            try:
+                parsed = json.loads(raw_payload)
+                if isinstance(parsed, dict):
+                    payload_dict = parsed  # type: ignore
+                    event_type = str(payload_dict.get("event_type", "unknown"))
+                else:
+                    payload_dict = {"raw_content": raw_payload}
+                    event_type = "unknown"
+            except json.JSONDecodeError:
+                logger.error("Failed to parse payload JSON")
+                payload_dict = {"raw_error": "Invalid JSON", "raw_content": raw_payload}
+                event_type = "parse_error"
+        else:
+            # Handle None or unexpected types
+            payload_dict = {}
+            event_type = "unknown"
 
         # Flexible parsing to handle potential structure variations
         webhook = WebhookPayload(
             log_id=data.get("log_id"),
             received_at=data.get("received_at"),
-            event_type=data.get("event_type"),
-            payload=data.get("payload", {}),
+            event_type=event_type,
+            payload=payload_dict,
             signature=data.get("signature"),
         )
 

@@ -225,31 +225,24 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             logger.warning("Invalid signature", extra={"signature": signature_header})
             return build_response(401, {"error": "Invalid signature"})
 
-        # 4. Parse Payload
-        try:
-            payload = json.loads(body)
-            event_type = payload.get("event_type", "unknown")
-        except json.JSONDecodeError:
-            return build_response(400, {"error": "Invalid JSON payload"})
-
-        # 5. Prepare Message
+        # 4. Prepare Message (No JSON parsing to save CPU/Time)
         log_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+        # We send the raw body to the queue. Parsing happens in the processor.
         message = {
             "log_id": log_id,
             "received_at": timestamp,
-            "event_type": event_type,
-            "payload": payload,
+            "payload": body,
             "signature": signature_header,
         }
 
-        # 6. Enqueue
+        # 5. Enqueue
         try:
             QueueService.enqueue_message(message)
             logger.info(
                 "Webhook accepted",
-                extra={"log_id": log_id, "event_type": event_type},
+                extra={"log_id": log_id},
             )
             return build_response(200, {"status": "received", "log_id": log_id})
 
