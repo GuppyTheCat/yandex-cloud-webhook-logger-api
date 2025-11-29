@@ -109,16 +109,23 @@ SIGNATURE1=$(calculate_signature "$PAYLOAD1" "$SECRET_KEY")
 print_info "Payload: $PAYLOAD1"
 print_info "Signature: $SIGNATURE1"
 
-RESPONSE1=$(curl -s -w "\n%{http_code}" -X POST "$WEBHOOK_URL" \
+RESPONSE1=$(curl -s -w "\n%{http_code} %{time_total}" -X POST "$WEBHOOK_URL" \
     -H "Content-Type: application/json" \
     -H "X-Webhook-Signature: $SIGNATURE1" \
     -d "$PAYLOAD1")
 
-HTTP_CODE1=$(echo "$RESPONSE1" | tail -n1)
+HTTP_CODE1=$(echo "$RESPONSE1" | tail -n1 | awk '{print $1}')
+TIME1=$(echo "$RESPONSE1" | tail -n1 | awk '{print $2}')
 BODY1=$(echo "$RESPONSE1" | head -n-1)
 
 if [ "$HTTP_CODE1" == "200" ]; then
     print_success "Valid signature accepted (HTTP $HTTP_CODE1)"
+    print_info "Response time: ${TIME1}s"
+    if python3 -c "import sys; sys.exit(0 if float('$TIME1') < 0.5 else 1)"; then
+        print_success "Response time within limits (< 0.5s client-side)"
+    else
+        print_info "Response time > 0.5s (check network or function cold start)"
+    fi
     if command -v jq >/dev/null 2>&1; then
         echo "$BODY1" | jq '.'
     else
@@ -179,16 +186,18 @@ SIGNATURE3=$(calculate_signature "$PAYLOAD3" "$SECRET_KEY")
 print_info "Payload: $PAYLOAD3"
 print_info "Signature: $SIGNATURE3"
 
-RESPONSE3=$(curl -s -w "\n%{http_code}" -X POST "$WEBHOOK_URL" \
+RESPONSE3=$(curl -s -w "\n%{http_code} %{time_total}" -X POST "$WEBHOOK_URL" \
     -H "Content-Type: application/json" \
     -H "X-Webhook-Signature: $SIGNATURE3" \
     -d "$PAYLOAD3")
 
-HTTP_CODE3=$(echo "$RESPONSE3" | tail -n1)
+HTTP_CODE3=$(echo "$RESPONSE3" | tail -n1 | awk '{print $1}')
+TIME3=$(echo "$RESPONSE3" | tail -n1 | awk '{print $2}')
 BODY3=$(echo "$RESPONSE3" | head -n-1)
 
 if [ "$HTTP_CODE3" == "200" ]; then
     print_success "Valid signature accepted (HTTP $HTTP_CODE3)"
+    print_info "Response time: ${TIME3}s"
     if command -v jq >/dev/null 2>&1; then
         echo "$BODY3" | jq '.'
     else
@@ -230,6 +239,36 @@ if [ "$LOGS_HTTP_CODE" == "200" ]; then
         echo "$LOGS_BODY" | jq '.'
         TOTAL=$(echo "$LOGS_BODY" | jq '.total')
         print_info "Total logs: $TOTAL"
+        
+        # Verify log_id existence and processed_at
+        print_info "Verifying log processing status..."
+        
+        LOG_STATUS=$(echo "$LOGS_BODY" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+logs = data.get('logs', [])
+target_ids = ['$LOG_ID1', '$LOG_ID3']
+found = 0
+processed = 0
+
+for log in logs:
+    if log.get('log_id') in target_ids:
+        found += 1
+        if log.get('processed_at'):
+            processed += 1
+
+print(f'{found}/{len(target_ids)} found, {processed}/{len(target_ids)} processed')
+if found == len(target_ids) and processed == len(target_ids):
+    print('SUCCESS')
+else:
+    print('FAILURE')
+")
+        if [[ "$LOG_STATUS" == *"SUCCESS"* ]]; then
+            print_success "Verification: All test logs found and processed ($LOG_STATUS)"
+        else
+            print_error "Verification: Not all logs processed ($LOG_STATUS)"
+            print_info "Note: Messages might still be in queue if processor is slow."
+        fi
     else
         echo "$LOGS_BODY"
     fi
