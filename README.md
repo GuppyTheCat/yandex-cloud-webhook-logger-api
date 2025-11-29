@@ -74,9 +74,9 @@ External Service (GitHub/Stripe)
 
 ### Предварительные требования
 *   Аккаунт в Yandex Cloud
-*   Установленный [YC CLI](https://cloud.yandex.ru/docs/cli/quickstart)
-*   Установленный Docker
 *   Python 3.12+
+*   Установленный Docker
+*   Установленный [YC CLI](https://cloud.yandex.ru/docs/cli/quickstart)
 *   Установленный [YDB CLI](https://ydb.tech/docs/ru/reference/ydb-cli/install) (для создания таблиц)
     ```bash
     curl https://storage.yandexcloud.net/yandexcloud-ydb/install.sh | bash
@@ -86,6 +86,11 @@ External Service (GitHub/Stripe)
     curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
     unzip awscliv2.zip
     sudo ./aws/install
+    ```
+*   *(Опционально)* **jq** — для форматирования JSON вывода в логах и тестах.
+    ```bash
+    sudo apt-get install jq  # Linux (Debian/Ubuntu)
+    brew install jq          # macOS
     ```
 
 ### Шаг 1: Настройка окружения и прав доступа
@@ -279,6 +284,8 @@ yc serverless function allow-unauthenticated-invoke logs-api
     ```bash
     ./test_webhook.sh
     ```
+
+    > **Примечание:** Для удобного чтения JSON ответов рекомендуется установить `jq`. Скрипт автоматически обнаружит его и отформатирует вывод.
 
 Скрипт проверит:
 *   ✅ Отправку валидного вебхука (ожидается 200 OK)
