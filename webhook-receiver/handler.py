@@ -15,9 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 import boto3  # type: ignore
-import yandexcloud  # type: ignore
-from yandex.cloud.lockbox.v1.payload_service_pb2 import GetPayloadRequest  # type: ignore
-from yandex.cloud.lockbox.v1.payload_service_pb2_grpc import PayloadServiceStub  # type: ignore
+
 
 # --- Structured Logging Setup ---
 
@@ -87,15 +85,15 @@ logger.setLevel(logging.INFO)
 class Config:
     """Application configuration."""
 
-    LOCKBOX_SECRET_ID: str = os.environ.get("LOCKBOX_SECRET_ID", "")
+    LOCKBOX_SECRET_KEY: str = os.environ.get("LOCKBOX_SECRET_KEY", "")
     YMQ_QUEUE_URL: str = os.environ.get("YMQ_QUEUE_URL", "")
     AWS_ACCESS_KEY_ID: str = os.environ.get("AWS_ACCESS_KEY_ID", "")
     AWS_SECRET_ACCESS_KEY: str = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 
     @classmethod
     def validate(cls) -> None:
-        if not cls.LOCKBOX_SECRET_ID:
-            raise ValueError("LOCKBOX_SECRET_ID is required")
+        if not cls.LOCKBOX_SECRET_KEY:
+            raise ValueError("LOCKBOX_SECRET_KEY is required")
         if not cls.YMQ_QUEUE_URL:
             raise ValueError("YMQ_QUEUE_URL is required")
 
@@ -104,38 +102,16 @@ class Config:
 
 
 class SecretService:
-    """Handles retrieval and caching of secrets from Lockbox."""
+    """Handles retrieval of secrets."""
 
-    _cached_secret_key: str | None = None
-
-    @classmethod
-    def get_secret_key(cls, iam_token: str | None) -> str:
+    @staticmethod
+    def get_secret_key() -> str:
         """
-        Get webhook secret key, using cache if available.
+        Get webhook secret key from configuration.
         """
-        if cls._cached_secret_key:
-            return cls._cached_secret_key
-
-        if not Config.LOCKBOX_SECRET_ID:
-            raise ValueError("LOCKBOX_SECRET_ID not configured")
-
-        logger.info("Fetching secret from Lockbox (Cold Start / Cache Miss)")
-        try:
-            # Initialize SDK with IAM token from context
-            sdk: Any = yandexcloud.SDK(iam_token=iam_token)  # type: ignore
-            lockbox_client: Any = sdk.client(PayloadServiceStub)  # type: ignore
-            request = GetPayloadRequest(secret_id=Config.LOCKBOX_SECRET_ID)
-            response = lockbox_client.Get(request)
-
-            for entry in response.entries:
-                if entry.key == "SECRET_KEY":
-                    cls._cached_secret_key = str(entry.text_value)
-                    return cls._cached_secret_key
-
-            raise ValueError("SECRET_KEY not found in Lockbox secret")
-        except Exception as e:
-            logger.error(f"Lockbox error: {e}")
-            raise
+        if not Config.LOCKBOX_SECRET_KEY:
+            raise ValueError("LOCKBOX_SECRET_KEY not configured")
+        return Config.LOCKBOX_SECRET_KEY
 
 
 class QueueService:
@@ -232,14 +208,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         headers_lower = {k.lower(): v for k, v in headers.items()}
         signature_header = str(headers_lower.get("x-webhook-signature", ""))
 
-        # 2. Get Auth Token (from context)
-        iam_token = None
-        if context and hasattr(context, "token"):
-            iam_token = context.token.get("access_token")
-
-        # 3. Retrieve Secret (from Lockbox)
+        # 2. Retrieve Secret
         try:
-            secret_key = SecretService.get_secret_key(iam_token)
+            secret_key = SecretService.get_secret_key()
         except ValueError as e:
             logger.error(f"Configuration/Auth error: {e}")
             return build_response(500, {"error": "Configuration error"})
@@ -247,19 +218,19 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             logger.error(f"Secret retrieval failed: {e}")
             return build_response(500, {"error": "Internal setup error"})
 
-        # 4. Validate Signature
+        # 3. Validate Signature
         if not WebhookValidator.validate_signature(body, signature_header, secret_key):
             logger.warning("Invalid signature", extra={"signature": signature_header})
             return build_response(401, {"error": "Invalid signature"})
 
-        # 5. Parse Payload
+        # 4. Parse Payload
         try:
             payload = json.loads(body)
             event_type = payload.get("event_type", "unknown")
         except json.JSONDecodeError:
             return build_response(400, {"error": "Invalid JSON payload"})
 
-        # 6. Prepare Message
+        # 5. Prepare Message
         log_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -271,7 +242,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "signature": signature_header,
         }
 
-        # 7. Enqueue
+        # 6. Enqueue
         try:
             QueueService.enqueue_message(message)
             logger.info(

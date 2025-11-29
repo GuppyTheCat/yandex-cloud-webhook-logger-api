@@ -4,10 +4,3 @@
 # AWS SDK for Python (YMQ is SQS-compatible)
 boto3==1.35.0
 botocore==1.35.0
-
-# Yandex Cloud SDK for Lockbox integration
-yandexcloud==0.369.0
-
-# Required for service account authentication
-grpcio==1.70.0
-
